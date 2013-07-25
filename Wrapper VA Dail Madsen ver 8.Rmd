@@ -1,0 +1,369 @@
+Shenandoah National Park brook trout data
+focusing on 35 sites in 1996-2004 which were sampled every year (no NAs)
+========================================================================
+
+```{r working directory & libraries, warning=FALSE, message=FALSE}
+setwd('G:/Conte/Broad spatial modelling/VA/analysis/Dail Madsen 4 Powell/ver 8 structured DM/')
+getwd()
+library(reshape2)
+library(rjags)
+library(plyr)
+library(ggplot2)
+library(knitr)
+load.module("glm")
+```
+
+## Read in data
+```{r read in data}
+directory <- 'G:/Conte/Broad spatial modelling/VA/analysis/Dail Madsen 4 Powell/fishData/'
+fileName <- 'W_FI_MICOFISH_Stats_Rev2.csv'     # 'Rev2' has fish count for each electrofishing pass
+fishData <- as.data.frame(read.csv(file=paste( directory,fileName, sep='' ), header=TRUE))
+str(fishData)
+summary(fishData)
+```
+
+## Data organization
+```{r data organization}
+## Select brook trout data in 1996-2004
+bktData <- subset(fishData, Species_Code == 'BKT')
+bktData <- bktData[ order(bktData$SiteVisit_ID), ]
+## Select samples during summer (June-August) between 1996-2004
+bktSummerData <- bktData[bktData$Month >= 6 & bktData$Month <= 8 &
+                         bktData$Year >= 1996 & bktData$Year <= 2004, ]
+
+## site-by-year summary of when sampling has taken place (1:yes, 2:no)
+siteByYearSumm <- as.data.frame.matrix(table(bktSummerData$SiteID, bktSummerData$Year))
+# values '3' indicate Ages 'All', '1' & '0' are available
+# F_2F074 was sampled twice (two days in a row) in 1996; remove the second survey (1996-07-09_F_2F074)
+bktSummerData <- bktSummerData[bktSummerData$SiteVisit_ID != '1996-07-09_F_2F074', ]
+
+## convert into binary data for a quick summary
+siteByYearSummBinary <- siteByYearSumm
+siteByYearSummBinary[siteByYearSummBinary > 1] <- 1  # make it to binary
+yearSumm <- apply(siteByYearSummBinary, 2, sum)  # summary by year
+siteSumm <- apply(siteByYearSummBinary, 1, sum)  # summary by site
+
+## select sites surveyed every year 1996-2004
+siteByYearSummBinary2 <- cbind(siteByYearSummBinary, siteSumm)
+siteByYearSummBinary2 <- subset(siteByYearSummBinary2, siteSumm == 9)
+# 35 sites were sampled every year between 1996-2010
+## write.csv(siteByYearSummBinary2, "Best35sites1996_2004.csv", row.names=TRUE)
+
+## select brook trout count data for 35 sites for Dail Madsen model
+siteByYearSummBinary2rownames <- cbind(row.names(siteByYearSummBinary2), siteByYearSummBinary2)  # add row.names
+names(siteByYearSummBinary2rownames)[names(siteByYearSummBinary2rownames)=="row.names(siteByYearSummBinary2)"] <- "SiteID"
+selectList <- siteByYearSummBinary2rownames[,-(2:10)]
+
+lambSitesData <- merge(selectList, bktSummerData, by = 'SiteID', all.x=FALSE)
+lambSitesData$siteSumm <- NULL
+lambSitesData <- lambSitesData[ order(lambSitesData$SiteID, lambSitesData$Year, lambSitesData$AGE), ]
+
+# check to make sure that sites were selected ok
+length(unique(lambSitesData$SiteID))  # ok: 35 sites
+siteByYearSummDMsites <- as.data.frame.matrix(table(lambSitesData$SiteID, lambSitesData$Year))
+
+## add stream width data
+fileName <- 'A_WQSiteVisits_Discharge_info.csv'     # contains stream width for survey occasions
+widthData <- as.data.frame(read.csv(file=paste( directory,fileName, sep='' ), header=TRUE))
+# merge stream width data with fish data
+lambSitesData <- merge(lambSitesData, widthData, all.x=TRUE)
+# add extra columns for ID
+nYears=9; nGroups=3; nSites=35
+lambSitesData <- lambSitesData[ order(lambSitesData$SiteID, lambSitesData$Year, lambSitesData$AGE), ] # important
+lambSitesData$siteID <- rep(1:nSites, each = (nYears*nGroups))
+lambSitesData$yearID <- rep(rep(1:nYears, each=nGroups), nSites)
+lambSitesData$sizeID[lambSitesData$AGE=="All"] <- "All"
+lambSitesData$sizeID[lambSitesData$AGE=="0"] <- "1"
+lambSitesData$sizeID[lambSitesData$AGE=="1"] <- "2"
+```
+
+
+## Prepare data for Dail Madsen
+### Single pass only for the best 35 sites
+```{r prepare data for Dail Madsen}
+## select age 0 data and format for DM model
+dataAge0Long <- subset(lambSitesData, AGE == 0)
+dataAge0WidePass1 <- dcast(dataAge0Long, SiteID ~ Year, value.var="Pass1")
+#mean(dataAge0Long$Capture_Prob, na.rm=TRUE)  ## mean capture probability
+#sd(dataAge0Long$Capture_Prob, na.rm=TRUE)    ## sd capture probability
+
+## select age 1 data and format for DM model
+dataAge1Long <- subset(lambSitesData, AGE == 1)
+dataAge1WidePass1 <- dcast(dataAge1Long, SiteID ~ Year, value.var="Pass1") 
+#mean(dataAge1Long$Capture_Prob, na.rm=TRUE)  ## mean capture probability
+#sd(dataAge1Long$Capture_Prob, na.rm=TRUE)    ## sd capture probability
+
+# count in a vector for y1 
+countVector1 <- c(dataAge0WidePass1[,2], dataAge0WidePass1[,3], dataAge0WidePass1[,4], dataAge0WidePass1[,5],
+                 dataAge0WidePass1[,6], dataAge0WidePass1[,7], dataAge0WidePass1[,8], dataAge0WidePass1[,9],
+                 dataAge0WidePass1[,10],
+                 dataAge1WidePass1[,2], dataAge1WidePass1[,3], dataAge1WidePass1[,4], dataAge1WidePass1[,5],
+                 dataAge1WidePass1[,6], dataAge1WidePass1[,7], dataAge1WidePass1[,8], dataAge1WidePass1[,9],
+                 dataAge1WidePass1[,10])
+
+# y1 = data in an array
+nSites = 35; nYears = 9; nSizes=2; nPasses = 1        # no replicate for brook trout data
+y1 <- array(countVector1, dim=c(nSites,nYears,nSizes,nPasses), 
+            dimnames=list(paste("Reach",1:nSites,sep=''), paste("Year",1:nYears,sep=''), 
+                          paste("Size",1:nSizes,sep=''), paste("Pass",1:nPasses,sep='')))
+```
+
+### Three passes only for the best 35 sites
+```{r}
+dataAge0WidePass2 <- dcast(dataAge0Long, SiteID ~ Year, value.var="Pass2") 
+dataAge0WidePass3 <- dcast(dataAge0Long, SiteID ~ Year, value.var="Pass3") 
+dataAge1WidePass2 <- dcast(dataAge1Long, SiteID ~ Year, value.var="Pass2") 
+dataAge1WidePass3 <- dcast(dataAge1Long, SiteID ~ Year, value.var="Pass3") 
+
+# count in a vector for y2 
+countVector2 <- c(dataAge0WidePass1[,2], dataAge0WidePass1[,3], dataAge0WidePass1[,4], dataAge0WidePass1[,5],
+                  dataAge0WidePass1[,6], dataAge0WidePass1[,7], dataAge0WidePass1[,8], dataAge0WidePass1[,9],
+                  dataAge0WidePass1[,10],
+                  dataAge1WidePass1[,2], dataAge1WidePass1[,3], dataAge1WidePass1[,4], dataAge1WidePass1[,5],
+                  dataAge1WidePass1[,6], dataAge1WidePass1[,7], dataAge1WidePass1[,8], dataAge1WidePass1[,9],
+                  dataAge1WidePass1[,10],
+                  dataAge0WidePass2[,2], dataAge0WidePass2[,3], dataAge0WidePass2[,4], dataAge0WidePass2[,5],
+                  dataAge0WidePass2[,6], dataAge0WidePass2[,7], dataAge0WidePass2[,8], dataAge0WidePass2[,9],
+                  dataAge0WidePass2[,10],
+                  dataAge1WidePass2[,2], dataAge1WidePass2[,3], dataAge1WidePass2[,4], dataAge1WidePass2[,5],
+                  dataAge1WidePass2[,6], dataAge1WidePass2[,7], dataAge1WidePass2[,8], dataAge1WidePass2[,9],
+                  dataAge1WidePass2[,10],
+                  dataAge0WidePass3[,2], dataAge0WidePass3[,3], dataAge0WidePass3[,4], dataAge0WidePass3[,5],
+                  dataAge0WidePass3[,6], dataAge0WidePass3[,7], dataAge0WidePass3[,8], dataAge0WidePass3[,9],
+                  dataAge0WidePass3[,10],
+                  dataAge1WidePass3[,2], dataAge1WidePass3[,3], dataAge1WidePass3[,4], dataAge1WidePass3[,5],
+                  dataAge1WidePass3[,6], dataAge1WidePass3[,7], dataAge1WidePass3[,8], dataAge1WidePass3[,9],
+                  dataAge1WidePass3[,10])
+
+# y2 = data in an array
+nSites=35; nYears=9; nSizes=2; nPasses=3        # no replicate for brook trout data
+y2 <- array(countVector2, dim=c(nSites,nYears,nSizes,nPasses), 
+            dimnames=list(paste("Reach",1:nSites,sep=''), paste("Year",1:nYears,sep=''), 
+                          paste("Size",1:nSizes,sep=''), paste("Pass",1:nPasses,sep='')))
+```
+
+```{r pulling out covariates from Than's data file}
+directory <- 'G:/Conte/Broad spatial modelling/VA/analysis/Dail Madsen 4 Powell/Covariate/'
+fileName <- 'SHEN_lat-long.csv'   
+covData <- as.data.frame(read.csv(file=paste( directory,fileName, sep='' ), header=TRUE))
+str(covData)
+
+bestSiteList <- dataAge0WidePass1
+bestSiteList$SiteID2 <- substr(bestSiteList$SiteID, 3, 8)
+bestSiteList <- bestSiteList[,-(2:10)]
+
+bestSiteCov <- merge(bestSiteList, covData, by.x="SiteID2", by.y="SiteID")
+covData <- bestSiteCov[c("SiteID", "STREAM", "HUC8","REACH_CODE","County","Slope_deg","Elev_m",
+                         "MaxWidth_m","MaxDepth_m")] 
+
+## Pair plot
+# function for pearson correlation (http://www2.warwick.ac.uk/fac/sci/moac/people/students/peter_cock/r/iris_plots/)
+panel.pearson <- function(x, y, ...) {
+  horizontal <- (par("usr")[1] + par("usr")[2]) / 2; 
+  vertical <- (par("usr")[3] + par("usr")[4]) / 2; 
+  text(horizontal, vertical, format(cor(x,y), digits=2)) 
+}
+
+# pair plot
+pairs(covData[,6:9], main="Pairs plot of environmental covariates", upper.panel=panel.pearson)
+```
+
+```{r pairwise distance}
+library(sp)
+pairDist <- spDists(x=as.matrix(bestSiteCov[c("Lon_n83","Lat_n83")]), 
+                    y=as.matrix(bestSiteCov[c("Lon_n83","Lat_n83")]), longlat=TRUE)
+```
+
+```{r covariate effect on first pass yoy count}
+envEffectAge0count <- dataAge0WidePass1
+envEffectAge0count <- cbind(envEffectAge0count, covData[,6:9])
+envEffectAge0countLong <- melt(envEffectAge0count, 
+                               id.vars=c("SiteID","Slope_deg","Elev_m","MaxWidth_m","MaxDepth_m"),
+                               variable.name="year",
+                               value.name="FirstPassCount")
+
+envEffectAge1count <- dataAge1WidePass1
+envEffectAge1count <- cbind(envEffectAge1count, covData[,6:9])
+envEffectAge1countLong <- melt(envEffectAge1count, 
+                               id.vars=c("SiteID","Slope_deg","Elev_m","MaxWidth_m","MaxDepth_m"),
+                               variable.name="year",
+                               value.name="FirstPassCount")
+
+envEffectAllCountLong <- rbind(envEffectAge0countLong, envEffectAge1countLong)
+envEffectAllCountLong$age <- rep(c(0,1), each=nrow(envEffectAge0countLong))
+
+# elevation effect
+ggplot(envEffectAllCountLong, aes(x=Elev_m, y=FirstPassCount)) +
+  geom_point(shape=1, size=3) +
+  facet_grid(age ~ year) +
+  ggtitle("Elevation vs. first pass count for yoy (0) & adult (1) in each year")
+  
+# depth effect
+ggplot(envEffectAllCountLong, aes(x=MaxDepth_m, y=FirstPassCount)) +
+  geom_point(shape=1, size=3) +
+  facet_grid(age ~ year) +
+  ggtitle("Max depth vs. first pass count for yoy (0) & adult (1) in each year")
+
+# width effect
+ggplot(envEffectAllCountLong, aes(x=MaxWidth_m, y=FirstPassCount)) +
+  geom_point(shape=1, size=3) +
+  facet_grid(age ~ year) +
+  ggtitle("Max width vs. first pass count for yoy (0) & adult (1) in each year")
+
+# slope effect
+ggplot(envEffectAllCountLong, aes(x=Slope_deg, y=FirstPassCount)) +
+  geom_point(shape=1, size=3) +
+  facet_grid(age ~ year) +
+  ggtitle("Slope vs. first pass count for yoy (0) & adult (1) in each year")
+
+```
+
+```{r}
+library(gdata)
+keep('y1', 'y2', 'covData', 'pairDist')  #, sure=TRUE)
+```
+
+
+
+## Visualize capture probability (effect of year and stream width)
+```{r capture probability, eval=FALSE, echo=FALSE}
+### adult ###
+#############
+## select adult data
+lambSitesAdultData <- subset(lambSitesData, AGE == '1')
+#write.csv(lambSitesAdultData, "ShenBest35sites1996_2004.csv", row.names=TRUE)
+
+## plot capture probability diff among years
+str(lambSitesAdultData)
+lambSitesAdultData$Year <- as.factor(lambSitesAdultData$Year)
+ggplot(lambSitesAdultData, aes(x=Year, y=Capture_Prob)) + 
+  geom_boxplot() +
+  opts(strip.text.x = theme_text(size=14, face="bold"),
+       strip.text.y = theme_text(size=14, face="bold"),
+       axis.text.x = theme_text(size=12),
+       axis.text.y = theme_text(size=12),
+       axis.title.x = theme_text(size=14, face="bold"),
+       axis.title.y = theme_text(size=14, angle=90, face="bold")) 
+
+## plot capture prob vs. stream width, by year
+ggplot(lambSitesAdultData, aes(x=StreamWidth_m, y=Capture_Prob)) +
+  geom_point(shape=1) +
+  facet_wrap(~ yearID, ncol=3)
+
+### yoy ###
+###########
+## select yoy data
+lambSitesYoyData <- subset(lambSitesData, AGE == '0')
+#write.csv(lambSitesYoyData, "ShenBest35sites1996_2004_yoy.csv", row.names=TRUE)
+
+## plot capture probability diff among years
+str(lambSitesYoyData)
+lambSitesYoyData$Year <- as.factor(lambSitesYoyData$Year)
+ggplot(lambSitesYoyData, aes(x=Year, y=Capture_Prob)) + 
+  geom_boxplot() +
+  opts(strip.text.x = theme_text(size=14, face="bold"),
+       strip.text.y = theme_text(size=14, face="bold"),
+       axis.text.x = theme_text(size=12),
+       axis.text.y = theme_text(size=12),
+       axis.title.x = theme_text(size=14, face="bold"),
+       axis.title.y = theme_text(size=14, angle=90, face="bold")) 
+
+## plot capture prob vs. stream width, by year
+ggplot(lambSitesYoyData, aes(x=StreamWidth_m, y=Capture_Prob)) +
+  geom_point(shape=1) +
+  facet_wrap(~ yearID, ncol=3)
+```
+
+## More data organization for detection prob
+```{r more organization for detection p, eval=FALSE, echo=FALSE}
+## fill in stream width NA values with mean for each site
+siteMeanWidth <- aggregate(lambSitesData$StreamWidth_m, by=list(lambSitesData$siteID), FUN="mean", na.rm=TRUE)
+names(siteMeanWidth) <- c("siteID", "meanWidth")
+lambSitesData <- merge(lambSitesData, siteMeanWidth, all.x=TRUE)
+lambSitesData$strWidthCorrect <- ifelse(is.na(lambSitesData$StreamWidth_m), 
+                                              lambSitesData$meanWidth, lambSitesData$StreamWidth_m)
+lambSitestData <- lambSitesData[ order(lambSitesData$siteID), ]
+
+## fill in capture prob NA values based on yearly mean value for each size class
+yearMeanDetP <- aggregate(lambSitesData$Capture_Prob, by=list(lambSitesData$yearID, lambSitesData$sizeID), FUN="mean", na.rm=TRUE)
+names(yearMeanDetP) <- c("yearID","sizeID","meanDetP")
+lambSitesData <- merge(lambSitesData, yearMeanDetP, all.x=TRUE)
+lambSitesData$detProbCorrect <- ifelse(is.na(lambSitesData$Capture_Prob),
+                                       lambSitesData$meanDetP, lambSitesData$Capture_Prob)
+lambSitesData <- lambSitesData[ order(lambSitesData$siteID, lambSitesData$year, lambSitesData$sizeID), ]
+
+## estimate abundance (N/p): N is count from pass 1
+lambSitesData$estPopSize <- round((lambSitesData$Pass1+1)/lambSitesData$detProbCorrect)
+plot(lambSitesData$estPopSize, lambSitesData$Pop_Est)
+
+```
+
+
+
+## Setting up Dail Madsen model
+```{r setting up Dail Madsen}
+# Data structure
+nSites = 35; nYears = 9; nSizes = 2; nReps = 3
+
+# INITIAL VALUES
+
+#NNew and GNew are empty arrays
+#Fix SNew to some value greater than zero
+NNew <- array(NA, dim=c(nSites,nYears,nSizes), 
+              dimnames=list(paste("Site",1:nSites),paste("Year",1:nYears),paste("Size",1:nSizes)))
+
+GNew <- array(NA, dim=c(nSites,nYears-1,nSizes), 
+              dimnames=list(paste("Site",1:nSites),paste("Year",1:(nYears-1)),paste("Size",1:nSizes)))
+              
+SNew <- array(5, dim=c(nSites,nYears-1,nSizes), 
+              dimnames=list(paste("Site",1:nSites),paste("Year",1:(nYears-1)),paste("Size",1:nSizes)))
+
+ymax<- apply(y2,c(1,2,3),max)
+
+#Add a big number to ymax for each stage to fill in the NNew matrix
+NNew[,1,1] <- ymax[,1,1] + 1000
+NNew[,1,2] <- ymax[,1,2] + 1000
+
+#Very important!!
+#Make sure SNew+GNew=NNew or jags will not run!
+GNew = NNew[!is.na(NNew)]-SNew  
+
+# Bundle data
+Dat <- list(nSites=nSites, nYears=nYears, y=y2, 
+            elev=(covData$Elev_m - mean(covData$Elev_m))/sd(covData$Elev_m))
+
+# Set intial values
+InitStage <- function() list(N=NNew,G=GNew,S=SNew) # ,lambda[1]=200,lambda[2]=200)
+#Q=QNew, gamma=gammaNew, omega=omegaNew
+
+# Parameters to be monitored
+ParsStage <- c("meanOmega","sigmaOmega","Q","beta1","beta2","sigmaGamma","muGamma","rInit","pInit") #"gamma","omega"lambda","Q","Ntotal")
+```
+
+# Runnning Dail Madsen model
+```{r running Dail Madsen}
+# Sequential
+StageBurnin <- jags.model(paste("Shenandoah Dail Madsen ver 8.r",sep=""), 
+                          Dat, InitStage, n.chains=3, n.adapt=10000)
+
+#This is a burn-in 
+Niter=100000
+StageSample <- coda.samples(StageBurnin, ParsStage, n.iter=Niter)
+
+#Keep 10000/5 samples after the initial burn in of 10000 (above)
+Niter=100000
+out1 <- coda.samples(StageBurnin, ParsStage, n.iter=Niter, thin=50)
+summary(out1)
+plot(out1)
+
+out2 <- jags.samples(StageBurnin, ParsStage, n.iter=Niter, thin=5)
+
+str(out2)
+medianOmegSmallBKT<- medianOmegLargeBKT <- rep(0, nYears-1)
+for (i in 1:nYears-1){
+  medianOmegSmallBKT[i] <- median(out2$omega[1,i,1:2000,1:3])
+  medianOmegLargeBKT[i] <- median(out2$omega[2,i,1:2000,1:3]) 
+}
+#quantile(out2$omega[1,1,1:2000,1:3],c(.025, .975))
+```
+
